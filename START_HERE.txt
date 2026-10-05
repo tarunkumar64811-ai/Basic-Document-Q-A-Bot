@@ -1,0 +1,13 @@
+START HERE
+
+1. Open this folder in VS Code.
+2. Read README.md.
+3. Do NOT put an API key in source code.
+4. First create a Python virtual environment.
+5. Install requirements.txt.
+6. Put a test PDF into data/.
+7. Copy .env.example to .env and add your OpenAI API key.
+8. Run: python src/ingest.py
+9. Run: python src/main.py
+
+We will go through every step together.
