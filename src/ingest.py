@@ -1,8 +1,9 @@
 """
-Index PDF documents into a persistent Chroma vector database.
+Document ingestion pipeline for the RAG Document Q&A Bot.
 
-Pipeline:
-PDF files -> text extraction -> chunks -> embeddings -> ChromaDB
+Reads PDFs from the data folder, extracts text page by page,
+splits text into overlapping chunks, creates embeddings,
+and stores everything in persistent ChromaDB.
 """
 
 from pathlib import Path
@@ -13,45 +14,38 @@ from dotenv import load_dotenv
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
+
+# Load .env settings
 load_dotenv()
 
+# Project settings
 DATA_DIR = Path("data")
 CHROMA_DIR = Path("chroma_db")
 COLLECTION_NAME = "document_qa"
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-def extract_pages(pdf_path: Path):
-    """Return a list of (page_number, text) pairs."""
-    reader = PdfReader(str(pdf_path))
-    pages = []
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split text into overlapping chunks."""
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = " ".join(text.split())
+    text = " ".join(text.split())
 
-        if text:
-            pages.append((page_number, text))
-
-    return pages
-
-
-def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping character chunks."""
-    if overlap >= chunk_size:
-        raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
+    if not text:
+        return []
 
     chunks = []
     start = 0
 
     while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunk = text[start:end].strip()
+        end = start + chunk_size
+        chunk = text[start:end]
 
-        if chunk:
-            chunks.append(chunk)
+        if chunk.strip():
+            chunks.append(chunk.strip())
 
         if end >= len(text):
             break
@@ -61,78 +55,156 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
+def extract_pdf_chunks(pdf_path):
+    """Extract text from every page of a PDF and create chunks."""
+
+    reader = PdfReader(str(pdf_path))
+    chunks = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+
+        page_chunks = chunk_text(text)
+
+        for chunk_number, chunk in enumerate(page_chunks):
+            chunks.append(
+                {
+                    "text": chunk,
+                    "metadata": {
+                        "source": pdf_path.name,
+                        "page": page_number,
+                        "chunk": chunk_number,
+                    },
+                }
+            )
+
+    return chunks
+
+
 def main():
+    """Index all PDF documents in the data folder."""
+
+    print()
+    print("=" * 60)
+    print("RAG DOCUMENT INGESTION")
+    print("=" * 60)
+
+    if not DATA_DIR.exists():
+        print()
+        print("ERROR: data folder was not found.")
+        raise SystemExit(1)
+
     pdf_files = sorted(DATA_DIR.glob("*.pdf"))
 
     if not pdf_files:
-        print("No PDF files found in the data/ folder.")
-        print("Add at least one PDF and run this command again:")
-        print("python src/ingest.py")
-        return
+        print()
+        print("ERROR: No PDF files found in data folder.")
+        raise SystemExit(1)
 
-    print(f"Found {len(pdf_files)} PDF file(s).")
+    print()
+    print("PDF files found:")
 
-    # Load the local embedding model once.
+    for pdf in pdf_files:
+        print(f"  - {pdf.name}")
+
+    print()
     print("Loading embedding model...")
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    documents = []
-    metadatas = []
-    ids = []
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+
+    print("Connecting to ChromaDB...")
+
+    client = chromadb.PersistentClient(
+        path=str(CHROMA_DIR)
+    )
+
+    # Recreate collection so old/incorrect indexing is removed.
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+        print("Old collection removed.")
+    except Exception:
+        pass
+
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME
+    )
+
+    all_chunks = []
+
+    print()
+    print("Extracting documents...")
 
     for pdf_path in pdf_files:
-        print(f"Reading: {pdf_path.name}")
+        print(f"Processing: {pdf_path.name}")
 
-        for page_number, page_text in extract_pages(pdf_path):
-            page_chunks = chunk_text(page_text)
+        pdf_chunks = extract_pdf_chunks(pdf_path)
 
-            for chunk_index, chunk in enumerate(page_chunks):
-                documents.append(chunk)
-                metadatas.append(
-                    {
-                        "source": pdf_path.name,
-                        "page": page_number,
-                        "chunk": chunk_index,
-                    }
-                )
-                ids.append(
-                    f"{pdf_path.stem}-p{page_number}-c{chunk_index}"
-                )
+        print(f"  Chunks created: {len(pdf_chunks)}")
 
-    if not documents:
-        print("No extractable text was found in the PDFs.")
-        print("If your PDF is scanned images, OCR will be needed.")
-        return
+        all_chunks.extend(pdf_chunks)
 
-    print(f"Created {len(documents)} chunks.")
-    print("Creating embeddings in batches...")
+    if not all_chunks:
+        print()
+        print("ERROR: No text could be extracted from the PDFs.")
+        raise SystemExit(1)
 
-    # One batched call for the document chunks.
+    print()
+    print(f"Total chunks: {len(all_chunks)}")
+    print("Creating embeddings...")
+
+    texts = [item["text"] for item in all_chunks]
+
     embeddings = embedding_model.encode(
-        documents,
-        batch_size=32,
-        show_progress_bar=True,
+        texts,
         normalize_embeddings=True,
+        show_progress_bar=True,
     ).tolist()
 
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    ids = [
+        f"chunk_{index}"
+        for index in range(len(all_chunks))
+    ]
 
-    # Re-indexing should replace old records instead of duplicating them.
-    collection.upsert(
+    metadatas = [
+        item["metadata"]
+        for item in all_chunks
+    ]
+
+    collection.add(
         ids=ids,
-        documents=documents,
+        documents=texts,
         embeddings=embeddings,
         metadatas=metadatas,
     )
 
     print()
-    print("INDEXING COMPLETE")
-    print(f"Stored chunks: {collection.count()}")
-    print(f"Vector database: {CHROMA_DIR.resolve()}")
+    print("=" * 60)
+    print("INGESTION COMPLETE")
+    print("=" * 60)
+
     print()
-    print("Now run:")
-    print("python src/main.py")
+    print(f"Indexed chunks: {collection.count()}")
+
+    print()
+    print("Indexed documents:")
+
+    sources = sorted(
+        set(
+            metadata["source"]
+            for metadata in metadatas
+        )
+    )
+
+    for source in sources:
+        count = sum(
+            1
+            for metadata in metadatas
+            if metadata["source"] == source
+        )
+
+        print(f"  - {source}: {count} chunks")
+
+    print()
 
 
 if __name__ == "__main__":
